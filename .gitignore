@@ -1,0 +1,14 @@
+# Local configuration (contains credentials)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated data
+*.parquet
+*.parquet.part
+exports/
+*.log
