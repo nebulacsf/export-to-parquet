@@ -21,7 +21,11 @@ Designed for archive/backup tables with millions of rows (for example
 5. Data is written to `<destination>.part` and renamed to the final name only
    after the export succeeds, so an interrupted run never leaves a truncated
    file that looks valid.
-6. A summary is printed: rows, elapsed time, file size and final path.
+6. Column types are pinned once and reused for every batch. `TIME` columns are
+   exported as durations, dates/timestamps keep their temporal type, and
+   columns that mix incompatible Python types are exported as text instead of
+   aborting the export.
+7. A summary is printed: rows, elapsed time, file size and final path.
 
 ## Requirements
 
@@ -161,6 +165,30 @@ new export completes successfully.
 - **Indexes:** with `DB_ORDER_BY` set, an index on that column makes the read
   sequential instead of a full filesort.
 
+## Column type handling
+
+MySQL drivers can return more than one Python type for the same column. A
+`TIME` column, for example, usually arrives as `datetime.timedelta`, but
+PyMySQL returns the raw string for values it cannot parse; pyarrow then fails
+with errors like `object of type <class 'str'> cannot be converted to int`.
+
+The script normalizes each column once, on the first batch, and applies the
+same representation to every subsequent batch:
+
+| Database type | Parquet representation |
+|---------------|------------------------|
+| `TIME` | `duration[us]` (values like `"25:00:00"` are parsed, including negative and >24 h durations). |
+| `DATE`, `DATETIME`, `TIMESTAMP` | `date32` / `timestamp[us]`. |
+| `DECIMAL` | `decimal128(precision, scale)`. |
+| Text, JSON, enums | UTF-8 text (JSON objects are serialized with `json.dumps`). |
+| Columns mixing incompatible types | Text, preserving every value as a string. |
+| Columns that are entirely `NULL` in the first batch | Type taken from the table definition, so later batches can still be written. |
+
+Unparseable temporal values (for example MySQL zero dates `0000-00-00` or a
+malformed `TIME` string) are stored as `NULL` and reported in a warning. The
+export does not stop, and every other row is preserved. This is the same
+behavior as pandas' `errors="coerce"`.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -172,7 +200,9 @@ new export completes successfully.
 | `RuntimeError: 'cryptography' package is required` | MySQL 8 authentication plugin; `cryptography` is already in `requirements.txt`, rerun `make install`. |
 | `Permission denied` on `/var/backups/...` | The user cannot write there: use an `OUT` path you own, or adjust ownership/permissions on the directory. |
 | `No rows were returned` | Table is empty or `DB_TABLE` points to the wrong table. |
-| `does not match the schema of the first batch` | Rows change type between batches; lower `--chunk-size` or cast the column in a custom query. |
+| `object of type <class 'str'> cannot be converted to int` on a column | The driver returned mixed types for that column (common with `TIME` values). Fixed in v1.1.0: the column is normalized to one type for the whole export. |
+| `does not match the schema of the first batch` | Rows change type between batches; the script now coerces mismatched values, but lower `--chunk-size` or cast the column in the SQL query if it persists. |
+| Warnings about values `stored as null` | A `TIME`, `DATE` or `DATETIME` value could not be parsed (e.g. MySQL zero dates `0000-00-00`). The rest of the export continues; see below. |
 | Export seems stuck before the first batch | `ORDER BY` sorting a huge table; set `DB_ORDER_BY=` to skip it. |
 | `Incorrect datetime value: '0000-00-00'` | Legacy zero dates are not parseable; fix the data or filter those rows in the SQL query. |
 | `No space left on device` | Free space in the destination filesystem; the temporary `.part` file is deleted on failure. |

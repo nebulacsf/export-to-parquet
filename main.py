@@ -17,12 +17,15 @@ Examples
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import json
 import logging
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -30,10 +33,25 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import (
+    JSON as SAJSON,
+    Boolean as SABoolean,
+    Date as SADate,
+    DateTime as SADateTime,
+    Enum as SAEnum,
+    Float as SAFloat,
+    Integer as SAInteger,
+    LargeBinary as SALargeBinary,
+    Numeric as SANumeric,
+    String as SAString,
+    Time as SATime,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.engine import Engine, URL
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 LOGGER = logging.getLogger("export_to_parquet")
 
@@ -315,29 +333,393 @@ def resolve_output_path(
 
 
 # --------------------------------------------------------------------------- #
-# Export
+# Value normalization
+#
+# MySQL drivers are not always consistent about the Python type they return for
+# a column: TIME columns, for instance, usually arrive as datetime.timedelta
+# but PyMySQL returns the raw string for values it cannot parse. pyarrow infers
+# a single type from the first values it sees, so a mixed column raises errors
+# such as "object of type <class 'str'> cannot be converted to int". The
+# helpers below pin one representation per column for the whole export.
 # --------------------------------------------------------------------------- #
-def _to_arrow_table(chunk: pd.DataFrame, schema: Optional[pa.Schema]) -> pa.Table:
-    """Convert a pandas batch using the schema fixed by the first batch."""
-    if schema is None:
-        return pa.Table.from_pandas(chunk, preserve_index=False, safe=False)
+_TIME_RE = re.compile(r"^\s*([+-])?(\d+):(\d{1,2}):(\d{1,2})(?:\.(\d{1,6}))?\s*$")
 
+POLICY_LABELS = {
+    "duration": "duration",
+    "datetime": "timestamp",
+    "date": "date",
+    "string": "text",
+}
+
+
+def _is_missing(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(
+        value, (str, bytes, bytearray, dt.timedelta, dt.datetime, dt.date, dt.time)
+    ):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _category(value: object) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, Decimal):
+        return "decimal"
+    if isinstance(value, dt.datetime):
+        return "datetime"
+    if isinstance(value, dt.date):
+        return "date"
+    if isinstance(value, dt.time):
+        return "time"
+    if isinstance(value, dt.timedelta):
+        return "duration"
+    if isinstance(value, (bytes, bytearray)):
+        return "bytes"
+    if isinstance(value, str):
+        return "str"
+    return "other"
+
+
+def _parse_duration(value: object) -> Optional[dt.timedelta]:
+    """Convert a MySQL TIME value (timedelta, time or "HH:MM:SS") to timedelta."""
+    if _is_missing(value):
+        return None
+    if isinstance(value, dt.timedelta):
+        return value
+    if isinstance(value, dt.time):
+        return dt.timedelta(
+            hours=value.hour,
+            minutes=value.minute,
+            seconds=value.second,
+            microseconds=value.microsecond,
+        )
+    if isinstance(value, str):
+        match = _TIME_RE.match(value)
+        if match is None:
+            return None
+        sign, hours, minutes, seconds, fraction = match.groups()
+        parsed = dt.timedelta(
+            hours=int(hours),
+            minutes=int(minutes),
+            seconds=int(seconds),
+            microseconds=int((fraction or "0").ljust(6, "0")),
+        )
+        return -parsed if sign == "-" else parsed
+    return None
+
+
+def _format_duration(value: dt.timedelta) -> str:
+    """Format a timedelta as a MySQL-like [-]HH:MM:SS[.ffffff] string."""
+    negative = value < dt.timedelta(0)
+    absolute = abs(value)
+    total_microseconds = (
+        (absolute.days * 86_400 + absolute.seconds) * 1_000_000
+        + absolute.microseconds
+    )
+    hours, rest = divmod(total_microseconds, 3_600_000_000)
+    minutes, rest = divmod(rest, 60_000_000)
+    seconds, microseconds = divmod(rest, 1_000_000)
+
+    text_value = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if microseconds:
+        text_value += f".{microseconds:06d}".rstrip("0")
+    return f"-{text_value}" if negative else text_value
+
+
+def _stringify(value: object) -> Optional[str]:
+    """Text representation used when a column mixes incompatible types."""
+    if _is_missing(value):
+        return None
+    if isinstance(value, dt.timedelta):
+        return _format_duration(value)
+    if isinstance(value, dt.datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (dt.date, dt.time)):
+        return value.isoformat()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, default=str, ensure_ascii=False)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
+def _declared_columns(engine: Engine, table: str) -> dict[str, object]:
+    """Read the column types declared in the database (best effort)."""
+    schema_name, _, table_name = table.rpartition(".")
+    try:
+        columns = inspect(engine).get_columns(table_name, schema=schema_name or None)
+    except Exception as exc:  # noqa: BLE001 - reflection is only a hint
+        LOGGER.debug(
+            "Could not inspect table %s (%s); inferring types from data.", table, exc
+        )
+        return {}
+    return {column["name"]: column["type"] for column in columns}
+
+
+def _arrow_type_hint(declared: object) -> Optional[pa.DataType]:
+    """Best-effort Arrow type for columns that are entirely NULL in batch one."""
+    if declared is None:
+        return None
+    if isinstance(declared, SATime):
+        return pa.duration("us")
+    if isinstance(declared, SADateTime):
+        return pa.timestamp("us")
+    if isinstance(declared, SADate):
+        return pa.date32()
+    if isinstance(declared, SABoolean):
+        return pa.bool_()
+    if isinstance(declared, SAInteger):
+        return pa.int64()
+    if isinstance(declared, SAFloat):
+        return pa.float64()
+    if isinstance(declared, SANumeric):
+        precision = getattr(declared, "precision", None)
+        scale = getattr(declared, "scale", None)
+        if precision:
+            return pa.decimal128(min(int(precision), 38), int(scale or 0))
+        return pa.float64()
+    if isinstance(declared, SALargeBinary):
+        return pa.binary()
+    if isinstance(declared, (SAString, SAJSON, SAEnum)):
+        return pa.string()
+    return None
+
+
+def _is_temporal(declared: object) -> bool:
+    return isinstance(declared, (SATime, SADateTime, SADate))
+
+
+def _decide_policy(series: pd.Series, declared: object) -> str:
+    """Choose one representation for a column, based on its values or DDL type."""
+    if isinstance(declared, SATime):
+        return "duration"
+    if isinstance(declared, SADateTime):
+        return "datetime"
+    if isinstance(declared, SADate):
+        return "date"
+
+    values = [value for value in series.tolist() if not _is_missing(value)]
+    if not values:
+        return "default"
+
+    categories = {_category(value) for value in values}
+    if len(categories) == 1:
+        return "string" if categories == {"other"} else "default"
+
+    if categories <= {"duration", "time"}:
+        return "duration"
+
+    # Temporal values mixed with strings (invalid times, zero dates, ...).
+    if "duration" in categories or "time" in categories:
+        if all(_parse_duration(value) is not None for value in values):
+            return "duration"
+
+    return "string"
+
+
+def _apply_policy(series: pd.Series, policy: str, column: str) -> pd.Series:
+    before = int(series.isna().sum())
+
+    if policy == "duration":
+        converted = series.map(_parse_duration)
+        introduced = int(converted.isna().sum()) - before
+        if introduced > 0:
+            LOGGER.warning(
+                "'%s': %s value(s) could not be parsed as a time/duration "
+                "and were stored as null.",
+                column,
+                f"{introduced:,}",
+            )
+        return converted
+
+    if policy == "datetime":
+        converted = pd.to_datetime(series, errors="coerce")
+        introduced = int(converted.isna().sum()) - before
+        if introduced > 0:
+            LOGGER.warning(
+                "'%s': %s invalid datetime value(s) were stored as null.",
+                column,
+                f"{introduced:,}",
+            )
+        return converted
+
+    if policy == "date":
+        parsed = pd.to_datetime(series, errors="coerce")
+        introduced = int(parsed.isna().sum()) - before
+        if introduced > 0:
+            LOGGER.warning(
+                "'%s': %s invalid date value(s) were stored as null.",
+                column,
+                f"{introduced:,}",
+            )
+        return pd.Series(
+            [None if pd.isna(value) else value.date() for value in parsed],
+            index=series.index,
+            dtype=object,
+        )
+
+    if policy == "string":
+        return series.map(_stringify)
+
+    return series
+
+
+def _normalize_batch(
+    frame: pd.DataFrame,
+    policies: dict[str, str],
+    declared: dict[str, object],
+) -> pd.DataFrame:
+    """Apply the per-column policy chosen on the first batch to every batch."""
+    for name in frame.columns:
+        series = frame[name]
+        declared_type = declared.get(name)
+        is_object = series.dtype == object
+        is_text = isinstance(series.dtype, pd.StringDtype)
+
+        policy = policies.get(name)
+        if policy is None:
+            # Text columns without a temporal DDL type are already strings.
+            if not is_object and not (is_text and _is_temporal(declared_type)):
+                continue
+            policy = _decide_policy(series, declared_type)
+            policies[name] = policy
+            if policy == "default":
+                LOGGER.debug("Column '%s': keeping the inferred type.", name)
+                continue
+            LOGGER.info("Column '%s': exporting as %s.", name, POLICY_LABELS[policy])
+        elif policy == "default":
+            continue
+
+        frame[name] = _apply_policy(series, policy, name)
+
+    return frame
+
+
+def _coerce_series(
+    series: pd.Series, target: pa.DataType, column: str
+) -> tuple[pa.Array, int]:
+    """Convert one batch column to the pinned schema type, reporting new nulls."""
+    before = int(series.isna().sum())
+
+    if pa.types.is_string(target) or pa.types.is_large_string(target):
+        values = series.map(_stringify)
+        return pa.array(values, type=target), int(values.isna().sum()) - before
+
+    if pa.types.is_timestamp(target):
+        parsed = pd.to_datetime(series, errors="coerce")
+        return pa.array(parsed, type=target), int(parsed.isna().sum()) - before
+
+    if pa.types.is_date(target):
+        parsed = pd.to_datetime(series, errors="coerce")
+        values = [None if pd.isna(value) else value.date() for value in parsed]
+        return pa.array(values, type=target), int(parsed.isna().sum()) - before
+
+    if pa.types.is_duration(target):
+        values = series.map(_parse_duration)
+        return pa.array(values, type=target), int(values.isna().sum()) - before
+
+    if pa.types.is_integer(target):
+        parsed = pd.to_numeric(series, errors="coerce")
+        values = [None if pd.isna(value) else int(value) for value in parsed]
+        return pa.array(values, type=target), int(parsed.isna().sum()) - before
+
+    if pa.types.is_floating(target):
+        parsed = pd.to_numeric(series, errors="coerce")
+        return pa.array(parsed, type=target), int(parsed.isna().sum()) - before
+
+    if pa.types.is_binary(target):
+        values = [
+            None
+            if _is_missing(value)
+            else bytes(value)
+            if isinstance(value, (bytes, bytearray))
+            else str(value).encode("utf-8")
+            for value in series
+        ]
+        return pa.array(values, type=target), sum(
+            1 for value in values if value is None
+        ) - before
+
+    raise RuntimeError(
+        f"Column '{column}' contains values that cannot be converted to "
+        f"{target}. Cast the column explicitly in the SQL query or use a "
+        "different output."
+    )
+
+
+def _reconcile_table(frame: pd.DataFrame, schema: pa.Schema) -> pa.Table:
+    """Build a table that fits the pinned schema, coercing mismatched columns."""
+    arrays: list[pa.Array] = []
+    coerced: list[tuple[str, int]] = []
+
+    for field in schema:
+        if field.name not in frame.columns:
+            raise RuntimeError(f"The database batch is missing column '{field.name}'.")
+
+        series = frame[field.name]
+        try:
+            arrays.append(pa.array(series, type=field.type, from_pandas=True))
+            continue
+        except (
+            pa.ArrowInvalid,
+            pa.ArrowTypeError,
+            pa.ArrowNotImplementedError,
+            TypeError,
+        ):
+            pass
+
+        array, nulls = _coerce_series(series, field.type, field.name)
+        arrays.append(array)
+        if nulls > 0:
+            coerced.append((field.name, nulls))
+
+    if coerced:
+        LOGGER.warning(
+            "Some values did not fit the Parquet schema and were stored as null: %s",
+            ", ".join(f"{name} ({count:,})" for name, count in coerced),
+        )
+
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def _to_arrow_table(chunk: pd.DataFrame, schema: Optional[pa.Schema]) -> pa.Table:
+    """Convert a pandas batch, using the schema fixed by the first batch."""
     try:
         return pa.Table.from_pandas(
             chunk, schema=schema, preserve_index=False, safe=False
         )
     except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
-        LOGGER.debug("Direct batch conversion failed (%s); trying an explicit cast.", exc)
+        if schema is None:
+            raise
+        LOGGER.debug("Batch does not fit the pinned schema (%s); coercing columns.", exc)
+        return _reconcile_table(chunk, schema)
 
-    table = pa.Table.from_pandas(chunk, preserve_index=False, safe=False)
-    try:
-        return table.cast(schema)
-    except Exception as cast_exc:  # noqa: BLE001 - surfaced with a clear message
-        raise RuntimeError(
-            "A batch returned by the database does not match the schema of the "
-            "first batch. Try a smaller batch size or cast the conflicting "
-            "columns explicitly in the SQL query."
-        ) from cast_exc
+
+def _with_declared_hints(schema: pa.Schema, declared: dict[str, object]) -> pa.Schema:
+    """Give all-NULL columns a real type, taken from the table definition."""
+    fields: list[pa.Field] = []
+    changed = False
+
+    for field in schema:
+        hint = _arrow_type_hint(declared.get(field.name))
+        if pa.types.is_null(field.type) and hint is not None:
+            fields.append(
+                pa.field(field.name, hint, nullable=True, metadata=field.metadata)
+            )
+            changed = True
+        else:
+            fields.append(field)
+
+    if not changed:
+        return schema
+    return pa.schema(fields, metadata=schema.metadata)
 
 
 def export_table(
@@ -367,6 +749,8 @@ def export_table(
     rows_written = 0
     schema: Optional[pa.Schema] = None
     writer: Optional[pq.ParquetWriter] = None
+    policies: dict[str, str] = {}
+    declared = _declared_columns(engine, settings.table)
     started = time.perf_counter()
 
     try:
@@ -379,9 +763,12 @@ def export_table(
                     if chunk.empty:
                         continue
 
+                    chunk = _normalize_batch(chunk, policies, declared)
                     table = _to_arrow_table(chunk, schema)
                     if writer is None:
-                        schema = table.schema
+                        schema = _with_declared_hints(table.schema, declared)
+                        if schema != table.schema:
+                            table = table.cast(schema)
                         writer = pq.ParquetWriter(
                             temp_path, schema, compression=settings.compression
                         )
